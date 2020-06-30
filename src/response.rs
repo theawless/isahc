@@ -1,4 +1,8 @@
 use crate::Metrics;
+use futures_util::{
+    future::LocalBoxFuture,
+    io::{AsyncWrite, AsyncReadExt},
+};
 use http::{Response, Uri};
 use std::{
     fs::File,
@@ -8,6 +12,8 @@ use std::{
 
 /// Provides extension methods for working with HTTP responses.
 pub trait ResponseExt<T> {
+    fn content_length(&self) -> Option<u64>;
+
     /// Get the effective URI of this response. This value differs from the
     /// original URI provided when making the request if at least one redirect
     /// was followed.
@@ -31,6 +37,11 @@ pub trait ResponseExt<T> {
     where
         T: Read;
 
+    fn copy_to_async<'a, W>(&'a mut self, writer: W) -> CopyToFuture<'a>
+    where
+        T: futures_io::AsyncRead + Unpin,
+        W: AsyncWrite + Unpin + 'a;
+
     /// Write the response body to a file.
     ///
     /// This method makes it convenient to download a file using a GET request
@@ -53,6 +64,22 @@ pub trait ResponseExt<T> {
     {
         File::create(path).and_then(|f| self.copy_to(f))
     }
+
+    fn bytes(&mut self) -> io::Result<Vec<u8>>
+    where
+        T: Read;
+
+    fn bytes_async(&mut self) -> BytesFuture<'_>
+    where
+        T: futures_io::AsyncRead + Unpin;
+
+    fn consume(&mut self) -> io::Result<u64>
+    where
+        T: Read;
+
+    fn consume_async(&mut self) -> ConsumeFuture<'_>
+    where
+        T: futures_io::AsyncRead + Unpin;
 
     /// Read the response body as a string.
     ///
@@ -127,9 +154,30 @@ pub trait ResponseExt<T> {
     where
         D: serde::de::DeserializeOwned,
         T: Read;
+
+    /// Deserialize the response body as JSON into a given type asynchronously.
+    ///
+    /// # Availability
+    ///
+    /// This method is only available when the [`json`](index.html#json) feature
+    /// is enabled.
+    #[cfg(feature = "json")]
+    fn json_async<D>(&mut self) -> DeserializeJsonFuture<'_, D>
+    where
+        D: serde::de::DeserializeOwned,
+        T: futures_io::AsyncRead + Unpin;
 }
 
 impl<T> ResponseExt<T> for Response<T> {
+    fn content_length(&self) -> Option<u64> {
+        self.headers()
+            .get(http::header::CONTENT_LENGTH)?
+            .to_str()
+            .ok()?
+            .parse()
+            .ok()
+    }
+
     fn effective_uri(&self) -> Option<&Uri> {
         self.extensions().get::<EffectiveUri>().map(|v| &v.0)
     }
@@ -143,6 +191,64 @@ impl<T> ResponseExt<T> for Response<T> {
         T: Read,
     {
         io::copy(self.body_mut(), &mut writer)
+    }
+
+    fn copy_to_async<'a, W>(&'a mut self, mut writer: W) -> CopyToFuture<'a>
+    where
+        T: futures_io::AsyncRead + Unpin,
+        W: AsyncWrite + Unpin + 'a,
+    {
+        Box::pin(async move {
+            futures_util::io::copy(self.body_mut(), &mut writer).await
+        })
+    }
+
+    fn bytes(&mut self) -> io::Result<Vec<u8>>
+    where
+        T: Read,
+    {
+        let mut buf = Vec::new();
+
+        if let Some(length) = self.content_length() {
+            buf.reserve(length as usize);
+        }
+
+        self.body_mut().read_to_end(&mut buf)?;
+
+        Ok(buf)
+    }
+
+    fn bytes_async(&mut self) -> BytesFuture<'_>
+    where
+        T: futures_io::AsyncRead + Unpin,
+    {
+        Box::pin(async move {
+            let mut buf = Vec::new();
+
+            if let Some(length) = self.content_length() {
+                buf.reserve(length as usize);
+            }
+
+            self.body_mut().read_to_end(&mut buf).await?;
+
+            Ok(buf)
+        })
+    }
+
+    fn consume(&mut self) -> io::Result<u64>
+    where
+        T: Read,
+    {
+        self.copy_to(io::sink())
+    }
+
+    fn consume_async(&mut self) -> ConsumeFuture<'_>
+    where
+        T: futures_io::AsyncRead + Unpin,
+    {
+        Box::pin(async move {
+            self.copy_to_async(futures_util::io::sink()).await
+        })
     }
 
     #[cfg(feature = "text-decoding")]
@@ -169,6 +275,26 @@ impl<T> ResponseExt<T> for Response<T> {
     {
         serde_json::from_reader(self.body_mut())
     }
+
+    #[cfg(feature = "json")]
+    fn json_async<D>(&mut self) -> DeserializeJsonFuture<'_, D>
+    where
+        D: serde::de::DeserializeOwned,
+        T: futures_io::AsyncRead + Unpin,
+    {
+        Box::pin(async move {
+            self.bytes_async().await
+                .map_err(|e| serde_json::Error::io(e))
+                .and_then(|bytes| serde_json::from_slice(&bytes))
+        })
+    }
 }
+
+type BytesFuture<'a> = LocalBoxFuture<'a, io::Result<Vec<u8>>>;
+type CopyToFuture<'a> = LocalBoxFuture<'a, io::Result<u64>>;
+type ConsumeFuture<'a> = LocalBoxFuture<'a, io::Result<u64>>;
+
+#[cfg(feature = "json")]
+type DeserializeJsonFuture<'a, D> = LocalBoxFuture<'a, Result<D, serde_json::Error>>;
 
 pub(crate) struct EffectiveUri(pub(crate) Uri);
