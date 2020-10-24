@@ -506,17 +506,21 @@ impl AgentContext {
                 if key == 0 {
                     let key = self.sockets.insert(socket) + 1;
                     self.multi.assign(socket, key)?;
-                    self.poller.add(socket, Event {
+                    if let Err(e) = self.poller.add(socket, Event {
                         key,
                         readable: events.input(),
                         writable: events.output(),
-                    })?;
+                    }) {
+                        tracing::warn!("error from poller: {}", e);
+                    }
                 } else {
-                    self.poller.modify(socket, Event {
+                    if let Err(e) = self.poller.modify(socket, Event {
                         key,
                         readable: events.input(),
                         writable: events.output(),
-                    })?;
+                    }) {
+                        tracing::warn!("error from poller: {}", e);
+                    }
                 }
             }
         }
