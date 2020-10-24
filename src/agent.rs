@@ -8,19 +8,24 @@
 //! Since request executions are driven through futures, the agent also acts as
 //! a specialized task executor for tasks related to requests.
 
-use crate::handler::RequestHandler;
-use crate::task::{UdpWaker, WakerExt};
-use crate::Error;
+use crate::{
+    handler::RequestHandler,
+    task::WakerExt,
+    Error,
+};
 use crossbeam_channel::{Receiver, Sender};
 use crossbeam_utils::sync::WaitGroup;
-use curl::multi::WaitFd;
+use futures_util::task::ArcWake;
+use polling::{Event, Poller};
 use slab::Slab;
-use std::net::UdpSocket;
-use std::sync::{Arc, Mutex};
-use std::task::Waker;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::{
+    sync::{atomic::{AtomicUsize, Ordering}, Arc, Mutex},
+    task::Waker,
+    thread,
+    time::{Duration, Instant},
+};
 
+static NEXT_AGENT_ID: AtomicUsize = AtomicUsize::new(0);
 const WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 
 type EasyHandle = curl::easy::Easy2<RequestHandler>;
@@ -67,15 +72,14 @@ impl AgentBuilder {
         // See #189.
         curl::init();
 
-        // Create an UDP socket for the agent thread to listen for wakeups on.
-        let wake_socket = UdpSocket::bind("127.0.0.1:0")?;
-        wake_socket.set_nonblocking(true)?;
-        let wake_addr = wake_socket.local_addr()?;
-        let port = wake_addr.port();
-        let waker = futures_util::task::waker(Arc::new(UdpWaker::connect(wake_addr)?));
-        tracing::debug!("agent waker listening on {}", wake_addr);
+        // Create an I/O poller for driving curl's sockets.
+        let poller = Arc::new(Poller::new()?);
+
+        // Make a waker that will notify the poller.
+        let waker = futures_util::task::waker(Arc::new(PollerWaker(poller.clone())));
 
         let (message_tx, message_rx) = crossbeam_channel::unbounded();
+        let (socket_updates_tx, socket_updates_rx) = crossbeam_channel::unbounded();
 
         let wait_group = WaitGroup::new();
         let wait_group_thread = wait_group.clone();
@@ -86,7 +90,7 @@ impl AgentBuilder {
 
         // Create a span for the agent thread that outlives this method call,
         // but rather was caused by it.
-        let agent_span = tracing::debug_span!("agent_thread", port);
+        let agent_span = tracing::debug_span!("agent_thread");
         agent_span.follows_from(tracing::Span::current());
 
         let handle = Handle {
@@ -94,7 +98,7 @@ impl AgentBuilder {
             waker: waker.clone(),
             join_handle: Mutex::new(Some(
                 thread::Builder::new()
-                    .name(format!("isahc-agent-{}", port))
+                    .name(format!("isahc-agent-{}", NEXT_AGENT_ID.fetch_add(1, Ordering::SeqCst)))
                     .spawn(move || {
                         let _enter = agent_span.enter();
                         let mut multi = curl::multi::Multi::new();
@@ -112,15 +116,22 @@ impl AgentBuilder {
                             multi.set_max_connects(connection_cache_size)?;
                         }
 
+                        multi.socket_function(move |socket, events, key| {
+                            let _ = socket_updates_tx.send((socket, events, key));
+                        })?;
+
                         let agent = AgentContext {
                             multi,
                             multi_messages: crossbeam_channel::unbounded(),
                             message_tx,
                             message_rx,
-                            wake_socket,
                             requests: Slab::new(),
                             close_requested: false,
                             waker,
+                            poller,
+                            sockets: Slab::new(),
+                            socket_updates: socket_updates_rx,
+                            socket_events: Vec::new(),
                         };
 
                         drop(wait_group_thread);
@@ -179,9 +190,6 @@ struct AgentContext {
     /// Incoming messages from the agent handle.
     message_rx: Receiver<Message>,
 
-    /// Used to wake up the agent when polling.
-    wake_socket: UdpSocket,
-
     /// Contains all of the active requests.
     requests: Slab<curl::multi::Easy2Handle<RequestHandler>>,
 
@@ -190,6 +198,19 @@ struct AgentContext {
 
     /// A waker that can wake up the agent thread while it is polling.
     waker: Waker,
+
+    /// All of the sockets that curl has asked us to keep track of.
+    sockets: Slab<curl::multi::Socket>,
+
+    /// This is the poller we use to poll for socket activity!
+    poller: Arc<Poller>,
+
+    /// Socket events that have occurred. We re-use this vec every call for
+    /// efficiency.
+    socket_events: Vec<Event>,
+
+    /// Queue of socket registration updates from the multi handle.
+    socket_updates: Receiver<(curl::multi::Socket, curl::multi::SocketEvents, usize)>,
 }
 
 /// A message sent from the main thread to the agent thread.
@@ -336,26 +357,6 @@ impl AgentContext {
         Ok(())
     }
 
-    fn get_wait_fds(&self) -> [WaitFd; 1] {
-        let mut fd = WaitFd::new();
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            fd.set_fd(self.wake_socket.as_raw_fd());
-        }
-
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::AsRawSocket;
-            fd.set_fd(self.wake_socket.as_raw_socket());
-        }
-
-        fd.poll_on_read(true);
-
-        [fd]
-    }
-
     /// Polls the message channel for new messages from any agent handles.
     ///
     /// If there are no active requests right now, this function will block
@@ -466,11 +467,6 @@ impl AgentContext {
 
     /// Run the agent in the current thread until requested to stop.
     fn run(mut self) -> Result<(), Error> {
-        let mut wait_fds = self.get_wait_fds();
-        let mut wait_fd_buf = [0; 1024];
-
-        debug_assert_eq!(wait_fds.len(), 1);
-
         // Agent main loop.
         loop {
             self.poll_messages()?;
@@ -483,19 +479,7 @@ impl AgentContext {
             self.dispatch()?;
 
             // Block until activity is detected or the timeout passes.
-            self.multi.wait(&mut wait_fds, WAIT_TIMEOUT)?;
-
-            // We might have woken up early from the notify fd, so drain the
-            // socket to clear it.
-            if wait_fds[0].received_read() {
-                tracing::trace!("woke up from waker");
-
-                // Read data out of the wake socket to clean the buffer. While
-                // it's possible that there's a lot of data in the buffer, it
-                // is unlikely, so we do just one read. At worst case, the next
-                // wait call returns immediately.
-                let _ = self.wake_socket.recv_from(&mut wait_fd_buf);
-            }
+            self.wait()?;
         }
 
         tracing::debug!("agent shutting down");
@@ -503,6 +487,72 @@ impl AgentContext {
         self.requests.clear();
 
         Ok(())
+    }
+
+    /// Block until activity is detected or a timeout passes.
+    fn wait(&mut self) -> Result<(), Error> {
+        // Tell curl to update socket registration if necessary.
+        self.multi.action(curl_sys::CURL_SOCKET_TIMEOUT, &curl::multi::Events::new())?;
+
+        // Apply any requested socket updates now.
+        for (socket, events, key) in self.socket_updates.try_iter() {
+            if events.remove() {
+                debug_assert!(key > 0);
+                self.sockets.remove(key - 1);
+                if let Err(e) = self.poller.delete(socket) {
+                    tracing::debug!("error removing socket from poller: {}", e);
+                }
+            } else {
+                if key == 0 {
+                    let key = self.sockets.insert(socket) + 1;
+                    self.multi.assign(socket, key)?;
+                    self.poller.add(socket, Event {
+                        key,
+                        readable: events.input(),
+                        writable: events.output(),
+                    })?;
+                } else {
+                    self.poller.modify(socket, Event {
+                        key,
+                        readable: events.input(),
+                        writable: events.output(),
+                    })?;
+                }
+            }
+        }
+
+        // Ask curl how long we should poll for, limited to a maximum we chose.
+        let timeout = self.multi.get_timeout()?
+            .map(|t| t.min(WAIT_TIMEOUT))
+            .unwrap_or(WAIT_TIMEOUT);
+
+        self.poller.wait(&mut self.socket_events,Some(timeout))?;
+
+        if self.socket_events.is_empty() {
+            // Inform curl that the timeout was reached.
+            self.multi.action(curl_sys::CURL_SOCKET_TIMEOUT, &curl::multi::Events::new())?;
+        } else {
+            for event in self.socket_events.drain(..) {
+                debug_assert!(event.key > 0);
+
+                if let Some(socket) = self.sockets.get(event.key - 1) {
+                    let mut events = curl::multi::Events::new();
+                    events.input(event.readable);
+                    events.output(event.writable);
+                    self.multi.action(*socket, &events)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+struct PollerWaker(Arc<Poller>);
+
+impl ArcWake for PollerWaker {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        let _ = arc_self.0.notify();
     }
 }
 

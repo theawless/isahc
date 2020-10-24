@@ -41,6 +41,7 @@ futures-io = "0.3"
 http = "0.2.1"
 lazy_static = "1"
 log = "0.4"
+polling = "2.0"
 slab = "0.4"
 sluice = "0.5"
 
