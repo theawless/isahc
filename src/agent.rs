@@ -15,6 +15,7 @@ use crate::{
 };
 use crossbeam_channel::{Receiver, Sender};
 use crossbeam_utils::sync::WaitGroup;
+use curl::multi::{Multi, Socket, SocketEvents};
 use futures_util::task::ArcWake;
 use polling::{Event, Poller};
 use slab::Slab;
@@ -79,7 +80,6 @@ impl AgentBuilder {
         let waker = futures_util::task::waker(Arc::new(PollerWaker(poller.clone())));
 
         let (message_tx, message_rx) = crossbeam_channel::unbounded();
-        let (socket_updates_tx, socket_updates_rx) = crossbeam_channel::unbounded();
 
         let wait_group = WaitGroup::new();
         let wait_group_thread = wait_group.clone();
@@ -101,7 +101,7 @@ impl AgentBuilder {
                     .name(format!("isahc-agent-{}", NEXT_AGENT_ID.fetch_add(1, Ordering::SeqCst)))
                     .spawn(move || {
                         let _enter = agent_span.enter();
-                        let mut multi = curl::multi::Multi::new();
+                        let mut multi = Multi::new();
 
                         if max_connections > 0 {
                             multi.set_max_total_connections(max_connections)?;
@@ -116,23 +116,7 @@ impl AgentBuilder {
                             multi.set_max_connects(connection_cache_size)?;
                         }
 
-                        multi.socket_function(move |socket, events, key| {
-                            let _ = socket_updates_tx.send((socket, events, key));
-                        })?;
-
-                        let agent = AgentContext {
-                            multi,
-                            multi_messages: crossbeam_channel::unbounded(),
-                            message_tx,
-                            message_rx,
-                            requests: Slab::new(),
-                            close_requested: false,
-                            waker,
-                            poller,
-                            sockets: Slab::new(),
-                            socket_updates: socket_updates_rx,
-                            socket_events: Vec::new(),
-                        };
+                        let agent = AgentContext::new(multi, poller, waker, message_tx, message_rx)?;
 
                         drop(wait_group_thread);
 
@@ -170,65 +154,6 @@ pub(crate) struct Handle {
 
     /// A join handle for the agent thread.
     join_handle: Mutex<Option<thread::JoinHandle<Result<(), Error>>>>,
-}
-
-/// Internal state of an agent thread.
-///
-/// The agent thread runs the primary client event loop, which is essentially a
-/// traditional curl multi event loop with some extra bookkeeping and async
-/// features like wakers.
-struct AgentContext {
-    /// A curl multi handle, of course.
-    multi: curl::multi::Multi,
-
-    /// Queue of messages from the multi handle.
-    multi_messages: (Sender<MultiMessage>, Receiver<MultiMessage>),
-
-    /// Used to send messages to the agent thread.
-    message_tx: Sender<Message>,
-
-    /// Incoming messages from the agent handle.
-    message_rx: Receiver<Message>,
-
-    /// Contains all of the active requests.
-    requests: Slab<curl::multi::Easy2Handle<RequestHandler>>,
-
-    /// Indicates if the thread has been requested to stop.
-    close_requested: bool,
-
-    /// A waker that can wake up the agent thread while it is polling.
-    waker: Waker,
-
-    /// All of the sockets that curl has asked us to keep track of.
-    sockets: Slab<curl::multi::Socket>,
-
-    /// This is the poller we use to poll for socket activity!
-    poller: Arc<Poller>,
-
-    /// Socket events that have occurred. We re-use this vec every call for
-    /// efficiency.
-    socket_events: Vec<Event>,
-
-    /// Queue of socket registration updates from the multi handle.
-    socket_updates: Receiver<(curl::multi::Socket, curl::multi::SocketEvents, usize)>,
-}
-
-/// A message sent from the main thread to the agent thread.
-#[derive(Debug)]
-enum Message {
-    /// Requests the agent to close.
-    Close,
-
-    /// Begin executing a new request.
-    Execute(EasyHandle),
-
-    /// Request to resume reading the request body for the request with the
-    /// given ID.
-    UnpauseRead(usize),
-
-    /// Request to resume writing the response body for the request with the
-    /// given ID.
-    UnpauseWrite(usize),
 }
 
 #[derive(Debug)]
@@ -295,7 +220,114 @@ impl Drop for Handle {
     }
 }
 
+/// Internal state of an agent thread.
+///
+/// The agent thread runs the primary client event loop, which is essentially a
+/// traditional curl multi event loop with some extra bookkeeping and async
+/// features like wakers.
+struct AgentContext {
+    /// A curl multi handle, of course.
+    multi: Multi,
+
+    /// Queue of messages from the multi handle.
+    multi_messages: (Sender<MultiMessage>, Receiver<MultiMessage>),
+
+    /// Used to send messages to the agent thread.
+    message_tx: Sender<Message>,
+
+    /// Incoming messages from the agent handle.
+    message_rx: Receiver<Message>,
+
+    /// Contains all of the active requests.
+    requests: Slab<curl::multi::Easy2Handle<RequestHandler>>,
+
+    /// Indicates if the thread has been requested to stop.
+    close_requested: bool,
+
+    /// A waker that can wake up the agent thread while it is polling.
+    waker: Waker,
+
+    /// All of the sockets that curl has asked us to keep track of.
+    sockets: Slab<SocketContext>,
+
+    /// This is the poller we use to poll for socket activity!
+    poller: Arc<Poller>,
+
+    /// Socket events that have occurred. We re-use this vec every call for
+    /// efficiency.
+    socket_events: Vec<Event>,
+
+    /// Queue of socket registration updates from the multi handle.
+    socket_updates: Receiver<(Socket, SocketEvents, usize)>,
+
+    timeout_updates: Receiver<Option<Duration>>,
+}
+
+/// Context stored about a socket that we are managing on curl's behalf.
+struct SocketContext {
+    /// The socket handle.
+    socket: Socket,
+
+    /// Whether curl is interested in readable events.
+    readable: bool,
+
+    /// Whether curl is interested in writable events.
+    writable: bool,
+}
+
+/// A message sent from the main thread to the agent thread.
+#[derive(Debug)]
+enum Message {
+    /// Requests the agent to close.
+    Close,
+
+    /// Begin executing a new request.
+    Execute(EasyHandle),
+
+    /// Request to resume reading the request body for the request with the
+    /// given ID.
+    UnpauseRead(usize),
+
+    /// Request to resume writing the response body for the request with the
+    /// given ID.
+    UnpauseWrite(usize),
+}
+
 impl AgentContext {
+    fn new(
+        mut multi: Multi,
+        poller: Arc<Poller>,
+        waker: Waker,
+        message_tx: Sender<Message>,
+        message_rx: Receiver<Message>,
+    ) -> Result<Self, Error> {
+        let (socket_updates_tx, socket_updates_rx) = crossbeam_channel::unbounded();
+        let (timeout_tx, timeout_rx) = crossbeam_channel::unbounded();
+
+        multi.socket_function(move |socket, events, key| {
+            let _ = socket_updates_tx.send((socket, events, key));
+        })?;
+
+        multi.timer_function(move |timeout| {
+            timeout_tx.send(timeout).is_ok()
+        })?;
+
+        Ok(Self {
+            multi,
+            multi_messages: crossbeam_channel::unbounded(),
+            message_tx,
+            message_rx,
+            requests: Slab::new(),
+            close_requested: false,
+            waker,
+            poller,
+            sockets: Slab::new(),
+            socket_events: Vec::new(),
+            socket_updates: socket_updates_rx,
+            timeout_updates: timeout_rx,
+        })
+    }
+
     #[tracing::instrument(level = "trace", skip(self))]
     fn begin_request(&mut self, mut request: EasyHandle) -> Result<(), Error> {
         // Prepare an entry for storing this request while it executes.
@@ -339,6 +371,10 @@ impl AgentContext {
 
         // Add the handle to our bookkeeping structure.
         entry.insert(handle);
+
+        // This will trigger curl to invoke our callbacks for socket structures
+        // "very soon".
+        self.notify_curl_of_timeout()?;
 
         Ok(())
     }
@@ -441,8 +477,6 @@ impl AgentContext {
 
     #[tracing::instrument(level = "trace", skip(self))]
     fn dispatch(&mut self) -> Result<(), Error> {
-        self.multi.perform()?;
-
         // Collect messages from curl about requests that have completed,
         // whether successfully or with an error.
         self.multi.messages(|message| {
@@ -479,7 +513,7 @@ impl AgentContext {
             self.dispatch()?;
 
             // Block until activity is detected or the timeout passes.
-            self.wait()?;
+            self.poll_io()?;
         }
 
         tracing::debug!("agent shutting down");
@@ -490,63 +524,158 @@ impl AgentContext {
     }
 
     /// Block until activity is detected or a timeout passes.
-    fn wait(&mut self) -> Result<(), Error> {
-        // Tell curl to update socket registration if necessary.
-        self.multi.action(curl_sys::CURL_SOCKET_TIMEOUT, &curl::multi::Events::new())?;
-
+    fn poll_io(&mut self) -> Result<(), Error> {
         // Apply any requested socket updates now.
-        for (socket, events, key) in self.socket_updates.try_iter() {
-            if events.remove() {
-                debug_assert!(key > 0);
-                self.sockets.remove(key - 1);
-                if let Err(e) = self.poller.delete(socket) {
-                    tracing::debug!("error removing socket from poller: {}", e);
-                }
-            } else {
-                if key == 0 {
-                    let key = self.sockets.insert(socket) + 1;
-                    self.multi.assign(socket, key)?;
-                    if let Err(e) = self.poller.add(socket, Event {
-                        key,
-                        readable: events.input(),
-                        writable: events.output(),
-                    }) {
-                        tracing::warn!("error from poller: {}", e);
-                    }
-                } else {
-                    if let Err(e) = self.poller.modify(socket, Event {
-                        key,
-                        readable: events.input(),
-                        writable: events.output(),
-                    }) {
-                        tracing::warn!("error from poller: {}", e);
-                    }
-                }
+        while let Ok((socket, events, key)) = self.socket_updates.try_recv() {
+            self.update_socket(socket, events, key)?;
+        }
+
+        // Since our I/O events are oneshot, make sure we re-register sockets
+        // with the poller that previously were triggered last time we polled.
+        for event in self.socket_events.iter() {
+            if let Some(socket_ctx) = self.sockets.get(event.key - 1) {
+                self.poller_modify(socket_ctx.socket, event.key, socket_ctx.readable, socket_ctx.writable)?;
             }
         }
 
-        // Ask curl how long we should poll for, limited to a maximum we chose.
-        let timeout = self.multi.get_timeout()?
+        // Get the latest timeout value from curl that we should use, limited to
+        // a maximum we chose.
+        let timeout = self.timeout_updates
+            .try_iter()
+            .last()
+            .flatten()
             .map(|t| t.min(WAIT_TIMEOUT))
             .unwrap_or(WAIT_TIMEOUT);
 
+        // Clear all events from previous polling.
+        self.socket_events.clear();
+
+        // Block until either an I/O event occurs on a socket, the timeout is
+        // reached, or the agent handle interrupts us.
         self.poller.wait(&mut self.socket_events,Some(timeout))?;
 
+        // If no events are returned, then the timeout was likely reached.
         if self.socket_events.is_empty() {
-            // Inform curl that the timeout was reached.
-            self.multi.action(curl_sys::CURL_SOCKET_TIMEOUT, &curl::multi::Events::new())?;
-        } else {
-            for event in self.socket_events.drain(..) {
+            self.notify_curl_of_timeout()?;
+        }
+
+        // At least one I/O event occurred, handle them.
+        else {
+            for event in self.socket_events.iter() {
                 debug_assert!(event.key > 0);
 
-                if let Some(socket) = self.sockets.get(event.key - 1) {
+                if let Some(socket_ctx) = self.sockets.get(event.key - 1) {
                     let mut events = curl::multi::Events::new();
                     events.input(event.readable);
                     events.output(event.writable);
-                    self.multi.action(*socket, &events)?;
+                    self.multi.action(socket_ctx.socket, &events)?;
                 }
             }
         }
+
+        Ok(())
+    }
+
+    fn update_socket(&mut self, socket: Socket, events: SocketEvents, key: usize) -> Result<(), Error> {
+        // Curl is asking us to stop polling this socket.
+        if events.remove() {
+            // Curl should never ask us to stop polling a socket it never told
+            // us about in the first place!
+            debug_assert!(key > 0);
+
+            // Remove this socket from our bookkeeping.
+            self.sockets.remove(key - 1);
+
+            // There's a good chance that curl has already closed this
+            // socket, at which point the poller implementation may have
+            // already forgotten about this socket (e.g. epoll). Therefore
+            // if we get an error back we just ignore it, as it is almost
+            // certainly benign.
+            if let Err(e) = self.poller.delete(socket) {
+                tracing::debug!(key = key, fd = socket, "error removing socket from poller: {}", e);
+            }
+        }
+
+        // This is a new socket, at least from curl's perspective. Set up a new
+        // socket context for it, and then register it with the poller.
+        else if key == 0 {
+            let key = self.sockets.insert(SocketContext {
+                socket,
+                readable: events.input(),
+                writable: events.output(),
+            }) + 1;
+
+            // Tell curl about our chosen key for this socket.
+            self.multi.assign(socket, key)?;
+
+            // Add the socket to our poller.
+            self.poller_add(socket, key, events.input(), events.output())?;
+        }
+
+        // This is a socket we've seen before and are already managing.
+        else {
+            if let Some(socket_ctx) = self.sockets.get_mut(key - 1) {
+                // Update the interest we have recorded for this socket.
+                socket_ctx.readable = events.input();
+                socket_ctx.writable = events.output();
+
+                // Update the socket interests with our poller.
+                self.poller_modify(socket, key, events.input(), events.output())?;
+            } else {
+                // Curl should never give us a key that we did not first give to
+                // curl!
+                tracing::warn!("unknown key from curl: {}", key);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn poller_add(&self, socket: Socket, key: usize, readable: bool, writable: bool) -> Result<(), Error> {
+        // If this errors, we retry the operation as a modification instead.
+        // This is because this new socket might re-use a file descriptor that
+        // was previously closed, but is still registered with the poller.
+        // Retrying the operation as a modification is sufficient to handle
+        // this.
+        //
+        // This is especially common with the epoll backend.
+        if let Err(e) = self.poller.add(socket, Event {
+            key,
+            readable,
+            writable,
+        }) {
+            tracing::debug!("failed to add interest for socket key {}, retrying as a modify: {}", key, e);
+            self.poller.modify(socket, Event {
+                key,
+                readable,
+                writable,
+            })?;
+        }
+
+        Ok(())
+    }
+
+    fn poller_modify(&self, socket: Socket, key: usize, readable: bool, writable: bool) -> Result<(), Error> {
+        // If this errors, we retry the operation as an add instead. This is
+        // done because epoll is weird.
+        if let Err(e) = self.poller.modify(socket, Event {
+            key,
+            readable,
+            writable,
+        }) {
+            tracing::debug!("failed to modify interest for socket key {}, retrying as an add: {}", key, e);
+            self.poller.add(socket, Event {
+                key,
+                readable,
+                writable,
+            })?;
+        }
+
+        Ok(())
+    }
+
+    fn notify_curl_of_timeout(&self) -> Result<(), Error> {
+        self.multi.action(curl_sys::CURL_SOCKET_TIMEOUT, &curl::multi::Events::new())?;
 
         Ok(())
     }
