@@ -599,28 +599,34 @@ impl AgentContext {
         // This is a new socket, at least from curl's perspective. Set up a new
         // socket context for it, and then register it with the poller.
         else if key == 0 {
+            let readable = events.input() || events.input_and_output();
+            let writable = events.output() || events.input_and_output();
+
             let key = self.sockets.insert(SocketContext {
                 socket,
-                readable: events.input(),
-                writable: events.output(),
+                readable,
+                writable,
             }) + 1;
 
             // Tell curl about our chosen key for this socket.
             self.multi.assign(socket, key)?;
 
             // Add the socket to our poller.
-            self.poller_add(socket, key, events.input(), events.output())?;
+            self.poller_add(socket, key, readable, writable)?;
         }
 
         // This is a socket we've seen before and are already managing.
         else {
             if let Some(socket_ctx) = self.sockets.get_mut(key - 1) {
+                let readable = events.input() || events.input_and_output();
+                let writable = events.output() || events.input_and_output();
+
                 // Update the interest we have recorded for this socket.
-                socket_ctx.readable = events.input();
-                socket_ctx.writable = events.output();
+                socket_ctx.readable = readable;
+                socket_ctx.writable = writable;
 
                 // Update the socket interests with our poller.
-                self.poller_modify(socket, key, events.input(), events.output())?;
+                self.poller_modify(socket, key, readable, writable)?;
             } else {
                 // Curl should never give us a key that we did not first give to
                 // curl!

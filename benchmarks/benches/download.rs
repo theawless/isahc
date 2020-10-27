@@ -30,7 +30,7 @@ fn benchmark(c: &mut Criterion) {
 
                 transfer.perform().unwrap();
             },
-            BatchSize::SmallInput,
+            BatchSize::LargeInput,
         )
     });
 
@@ -45,7 +45,7 @@ fn benchmark(c: &mut Criterion) {
             |client| {
                 client.get(&endpoint).unwrap().copy_to(sink()).unwrap();
             },
-            BatchSize::SmallInput,
+            BatchSize::LargeInput,
         )
     });
 }
