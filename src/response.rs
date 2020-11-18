@@ -1,4 +1,4 @@
-use crate::{Metrics, trailer::Trailer};
+use crate::{redirect::EffectiveUri, trailer::Trailer, Metrics};
 use futures_lite::io::AsyncRead;
 use http::{Response, Uri};
 use std::{
@@ -236,8 +236,6 @@ impl<T> ResponseExt<T> for Response<T> {
         serde_json::from_reader(self.body_mut())
     }
 }
-
-pub(crate) struct EffectiveUri(pub(crate) Uri);
 
 pub(crate) struct LocalAddr(pub(crate) SocketAddr);
 
