@@ -2,14 +2,13 @@
 
 #![cfg(feature = "text-decoding")]
 
-use crate::headers::HasHeaders;
+use crate::{headers::HasHeaders, util::MaybeSend};
 use encoding_rs::{CoderResult, Encoding};
 use futures_lite::io::{AsyncRead, AsyncReadExt};
 use http::Response;
 use std::{
     future::Future,
     io,
-    marker::PhantomData,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -41,26 +40,15 @@ macro_rules! decode_reader {
 /// A future returning a response body decoded as text.
 #[allow(missing_debug_implementations)]
 #[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct TextFuture<'a, R> {
-    inner: Pin<Box<dyn Future<Output = io::Result<String>> + 'a>>,
-    _phantom: PhantomData<R>,
-}
+pub struct TextFuture<'a, R>(MaybeSend<R, Pin<Box<dyn Future<Output = io::Result<String>> + 'a>>>);
 
 impl<'a, R: Unpin> Future for TextFuture<'a, R> {
     type Output = io::Result<String>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.as_mut().inner.as_mut().poll(cx)
+        self.as_mut().0.as_mut().poll(cx)
     }
 }
-
-// Since we are boxing our future, we can't conditionally implement `Send` based
-// on whether the original future is `Send`. However, we know after inspection
-// that everything inside our implementation is `Send` except for the reader,
-// which may or may not be. We then put the reader in our wrapper future type
-// and conditionally implement `Send` if the reader is also `Send`.
-#[allow(unsafe_code)]
-unsafe impl<'r, R: Send> Send for TextFuture<'r, R> {}
 
 /// A streaming text decoder that supports multiple encodings.
 pub(crate) struct Decoder {
@@ -106,14 +94,21 @@ impl Decoder {
     }
 
     /// Consume this decoder to decode text from a given asynchronous reader.
+    #[allow(unsafe_code)]
     pub(crate) fn decode_reader_async<'r, R>(self, mut reader: R) -> TextFuture<'r, R>
     where
         R: AsyncRead + Unpin + 'r,
     {
-        TextFuture {
-            inner: Box::pin(async move { decode_reader!(self, buf, reader.read(buf).await) }),
-            _phantom: PhantomData,
-        }
+        // Since we are boxing our future, we can't conditionally implement `Send` based
+        // on whether the original future is `Send`. However, we know after inspection
+        // that everything inside our implementation is `Send` except for the reader,
+        // which may or may not be. We then put the reader in our wrapper future type
+        // and conditionally implement `Send` if the reader is also `Send`.
+        TextFuture(unsafe {
+            MaybeSend::new_unchecked(Box::pin(async move {
+                decode_reader!(self, buf, reader.read(buf).await)
+            }))
+        })
     }
 
     /// Push additional bytes into the decoder, returning any trailing bytes
@@ -162,8 +157,8 @@ mod tests {
     fn utf8_decode() {
         let mut decoder = Decoder::new(encoding_rs::UTF_8);
 
-        assert_eq!(decoder.push(b"hello"), &[]);
-        assert_eq!(decoder.push(b" "), &[]);
+        assert_eq!(decoder.push(b"hello"), b"");
+        assert_eq!(decoder.push(b" "), b"");
         assert_eq!(decoder.finish(b"world"), "hello world");
     }
 

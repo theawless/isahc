@@ -253,6 +253,7 @@ mod request;
 mod response;
 mod task;
 mod text;
+mod util;
 
 pub mod auth;
 pub mod config;

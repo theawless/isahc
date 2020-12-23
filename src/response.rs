@@ -1,14 +1,11 @@
 use crate::{metrics::Metrics, redirect::EffectiveUri};
-use futures_lite::io::{AsyncRead, AsyncWrite};
+use futures_lite::io::{copy as copy_async, AsyncRead, AsyncWrite};
 use http::{Response, Uri};
 use std::{
     fs::File,
-    future::Future,
     io::{self, Read, Write},
     net::SocketAddr,
     path::Path,
-    pin::Pin,
-    task::{Context, Poll},
 };
 
 /// Provides extension methods for working with HTTP responses.
@@ -94,7 +91,7 @@ impl<T> ResponseExt<T> for Response<T> {
 }
 
 /// Provides extension methods for consuming HTTP response streams.
-pub trait ReadResponseExt<T: Read> {
+pub trait ReadResponseExt<T> {
     /// Copy the response body into a writer.
     ///
     /// Returns the number of bytes that were written.
@@ -210,7 +207,7 @@ impl<T: Read> ReadResponseExt<T> for Response<T> {
 }
 
 /// Provides extension methods for consuming asynchronous HTTP response streams.
-pub trait AsyncReadResponseExt<T: AsyncRead + Unpin> {
+pub trait AsyncReadResponseExt<T> {
     /// Copy the response body into a writer asynchronously.
     ///
     /// Returns the number of bytes that were written.
@@ -229,7 +226,7 @@ pub trait AsyncReadResponseExt<T: AsyncRead + Unpin> {
     /// println!("Read {} bytes", buf.len());
     /// # Ok(()) }
     /// ```
-    fn copy_to<'a, W>(&'a mut self, writer: W) -> CopyFuture<'a>
+    fn copy_to<'a, W>(&'a mut self, writer: W) -> CopyFuture<'a, T>
     where
         W: AsyncWrite + Unpin + 'a;
 
@@ -257,37 +254,93 @@ pub trait AsyncReadResponseExt<T: AsyncRead + Unpin> {
     /// ```
     #[cfg(feature = "text-decoding")]
     fn text(&mut self) -> crate::text::TextFuture<'_, &mut T>;
+
+    /// Deserialize the response body as JSON into a given type.
+    ///
+    /// # Availability
+    ///
+    /// This method is only available when the [`json`](index.html#json) feature
+    /// is enabled.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use isahc::prelude::*;
+    /// use serde_json::Value;
+    ///
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let json: Value = isahc::get_async("https://httpbin.org/json").await?
+    ///     .json().await?;
+    /// println!("author: {}", json["slideshow"]["author"]);
+    /// # Ok(()) }
+    /// ```
+    #[cfg(feature = "json")]
+    fn json<D>(&mut self) -> JsonFuture<'_, D>
+    where
+        D: serde::de::DeserializeOwned;
 }
 
 impl<T: AsyncRead + Unpin> AsyncReadResponseExt<T> for Response<T> {
-    fn copy_to<'a, W>(&'a mut self, writer: W) -> CopyFuture<'a>
+    fn copy_to<'a, W>(&'a mut self, writer: W) -> CopyFuture<'a, T>
     where
         W: AsyncWrite + Unpin + 'a,
     {
-        CopyFuture(Box::pin(async move {
-            futures_lite::io::copy(self.body_mut(), writer).await
-        }))
+        CopyFuture::new(async move { copy_async(self.body_mut(), writer).await })
     }
 
     #[cfg(feature = "text-decoding")]
     fn text(&mut self) -> crate::text::TextFuture<'_, &mut T> {
         crate::text::Decoder::for_response(&self).decode_reader_async(self.body_mut())
     }
+
+    #[cfg(feature = "json")]
+    fn json<D>(&mut self) -> JsonFuture<'_, D>
+    where
+        D: serde::de::DeserializeOwned,
+    {
+        JsonFuture::new(async move {
+            let mut buf = Vec::new();
+
+            // Serde does not support incremental parsing, so we have to resort
+            // to reading the entire response into memory first and then
+            // deserializing.
+            if let Err(e) = copy_async(self.body_mut(), &mut buf).await {
+                struct ErrorReader(Option<io::Error>);
+
+                impl Read for ErrorReader {
+                    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                        Err(self.0.take().unwrap())
+                    }
+                }
+
+                // Serde offers no public way to directly create an error from
+                // an I/O error, but we can do so in a roundabout way by parsing
+                // a reader that always returns the desired error.
+                serde_json::from_reader(ErrorReader(Some(e)))
+            } else {
+                serde_json::from_slice(&buf)
+            }
+        })
+    }
 }
 
-/// A future which copies all the response body bytes into a sink.
-#[allow(missing_debug_implementations)]
-#[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct CopyFuture<'a>(Pin<Box<dyn Future<Output = io::Result<u64>> + 'a>>);
+decl_future! {
+    /// A future which copies all the response body bytes into a sink.
+    pub type CopyFuture<T> = async io::Result<u64> where Send if T;
 
-impl Future for CopyFuture<'_> {
-    type Output = io::Result<u64>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.as_mut().poll(cx)
-    }
+    /// A future which attempts to deserialize the response body from JSON.
+    #[cfg(feature = "json")]
+    pub type JsonFuture<D> = async Result<D, serde_json::Error>;
 }
 
 pub(crate) struct LocalAddr(pub(crate) SocketAddr);
 
 pub(crate) struct RemoteAddr(pub(crate) SocketAddr);
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    static_assertions::assert_impl_all!(CopyFuture<'static, u8>: Send);
+    static_assertions::assert_not_impl_any!(CopyFuture<'static, std::rc::Rc<u8>>: Send);
+}
